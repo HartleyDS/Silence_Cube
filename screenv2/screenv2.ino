@@ -689,3 +689,5 @@ void loop() {
   // Small yield so the encoder stays responsive
   delay(2);
 }
+
+//How are you today?

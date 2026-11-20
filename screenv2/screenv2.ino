@@ -46,7 +46,11 @@ int readingsStored = 0;
 
 
 // ==================== SYSTEM STATE ===================
-int mode = 0;  // 0 = Sound Reactive, 1 = Ambient Lamp
+#define MODE_SOUND   0
+#define MODE_AMBIENT 1
+#define MODE_CLOCK   2
+
+int mode = MODE_SOUND;
 
 float currentDB = 0.0;
 float averageDB = 0.0;
@@ -55,7 +59,17 @@ unsigned long lastUpdateTime = 0;
 const unsigned long UPDATE_INTERVAL = 200;
 
 
-// ==================== ENCODER STATE ==================
+// ==================== CLOCK ==========================
+int clockHours   = 12;
+int clockMinutes = 0;
+int clockSeconds = 0;
+unsigned long lastTick = 0;
+
+bool isSettingTime = false;
+int  setField = 0;          // 0 = hours, 1 = minutes
+
+
+// ==================== ENCODER / BUTTON STATE =========
 int lastCLKState = HIGH;
 int lastButtonReading = HIGH;
 int stableButtonState = HIGH;
@@ -65,6 +79,10 @@ const unsigned long DEBOUNCE_DELAY = 40;
 
 unsigned long lastEncoderChange = 0;
 const unsigned long ENCODER_DEBOUNCE = 2;
+
+unsigned long buttonPressStart = 0;
+bool buttonHeld = false;
+const unsigned long LONG_PRESS_MS = 800;
 
 
 // ==================== COLOR PALETTE ==================
@@ -104,6 +122,11 @@ const char* ambientColorNames[COLOR_COUNT] = {
 int lastDrawnMode = -1;
 int lastDrawnColor = -1;
 int lastDrawnDBTenths = -9999;
+int lastDrawnHours = -1;
+int lastDrawnMinutes = -1;
+int lastDrawnSeconds = -1;
+bool lastDrawnSetting = false;
+int lastDrawnSetField = -1;
 
 
 // ==================== RGB LED FUNCTION ===============
@@ -125,68 +148,44 @@ void setColor(int red, int green, int blue) {
 
 
 // ==================== TWO-MICROPHONE READER ==========
-// Returns the louder of the two microphones (relative dB)
 float readLouderMicrophone() {
-
-  // --------------------------------
   // MIC A
-  // --------------------------------
   long sumA = 0;
-
   for (int i = 0; i < SAMPLE_COUNT; i++) {
     sumA += analogRead(MIC_A_PIN);
     delayMicroseconds(200);
   }
-
   float meanA = (float)sumA / SAMPLE_COUNT;
 
   float sumSquaresA = 0.0;
-
   for (int i = 0; i < SAMPLE_COUNT; i++) {
     float diff = analogRead(MIC_A_PIN) - meanA;
     sumSquaresA += diff * diff;
     delayMicroseconds(200);
   }
-
   float rmsA = sqrt(sumSquaresA / SAMPLE_COUNT);
   if (rmsA < 0.1) rmsA = 0.1;
   float dBA = 20.0 * log10(rmsA);
 
-
-  // --------------------------------
   // MIC B
-  // --------------------------------
   long sumB = 0;
-
   for (int i = 0; i < SAMPLE_COUNT; i++) {
     sumB += analogRead(MIC_B_PIN);
     delayMicroseconds(200);
   }
-
   float meanB = (float)sumB / SAMPLE_COUNT;
 
   float sumSquaresB = 0.0;
-
   for (int i = 0; i < SAMPLE_COUNT; i++) {
     float diff = analogRead(MIC_B_PIN) - meanB;
     sumSquaresB += diff * diff;
     delayMicroseconds(200);
   }
-
   float rmsB = sqrt(sumSquaresB / SAMPLE_COUNT);
   if (rmsB < 0.1) rmsB = 0.1;
   float dBB = 20.0 * log10(rmsB);
 
-
-  // --------------------------------
-  // RETURN LOUDER
-  // --------------------------------
-  if (dBA > dBB) {
-    return dBA;
-  }
-  else {
-    return dBB;
-  }
+  return (dBA > dBB) ? dBA : dBB;
 }
 
 
@@ -195,7 +194,6 @@ void resetBuffer() {
   for (int i = 0; i < BUFFER_SIZE; i++) {
     dBBuffer[i] = 0.0;
   }
-
   bufferIndex = 0;
   readingsStored = 0;
   currentDB = 0.0;
@@ -204,8 +202,6 @@ void resetBuffer() {
 
 
 float updateBuffer(float newReading) {
-
-  // Reject extreme outliers when we already have a stable average
   if (readingsStored > 3 && fabs(newReading - averageDB) > 6.0) {
     newReading = averageDB;
   }
@@ -219,12 +215,11 @@ float updateBuffer(float newReading) {
 
   float weightedTotal = 0.0;
   float totalWeight = 0.0;
-
   int oldestIndex = (bufferIndex - readingsStored + BUFFER_SIZE) % BUFFER_SIZE;
 
   for (int i = 0; i < readingsStored; i++) {
     int index = (oldestIndex + i) % BUFFER_SIZE;
-    float weight = i + 1;               // newer samples weigh more
+    float weight = i + 1;
     weightedTotal += dBBuffer[index] * weight;
     totalWeight += weight;
   }
@@ -232,7 +227,6 @@ float updateBuffer(float newReading) {
   if (totalWeight > 0.0) {
     return weightedTotal / totalWeight;
   }
-
   return newReading;
 }
 
@@ -241,67 +235,18 @@ float updateBuffer(float newReading) {
 // Same thresholds as the LED colour steps
 // --------------------------------
 int getSoundColorIndex(float averageDB) {
-
-  if (averageDB < 2) {
-
-    return 0;                     // 1. BLUE
-
-  }
-  else if (averageDB < 4) {
-
-    return 1;                     // 2. BLUE-CYAN
-
-  }
-  else if (averageDB < 6) {
-
-    return 2;                     // 3. CYAN
-
-  }
-  else if (averageDB < 8) {
-
-    return 3;                     // 4. CYAN-GREEN
-
-  }
-  else if (averageDB < 10) {
-
-    return 4;                     // 5. GREEN
-
-  }
-  else if (averageDB < 12) {
-
-    return 5;                     // 6. YELLOW-GREEN
-
-  }
-  else if (averageDB < 14) {
-
-    return 6;                     // 7. YELLOW
-
-  }
-  else if (averageDB < 16) {
-
-    return 7;                     // 8. ORANGE
-
-  }
-  else if (averageDB < 18) {
-
-    return 8;                     // 9. ORANGE-RED
-
-  }
-  else if (averageDB < 20) {
-
-    return 9;                     // 10. RED
-
-  }
-  else if (averageDB < 22) {
-
-    return 10;                    // 11. RED-PURPLE
-
-  }
-  else {
-
-    return 11;                    // 12. DEEP PURPLE
-
-  }
+  if      (averageDB <  2) return 0;
+  else if (averageDB <  4) return 1;
+  else if (averageDB <  6) return 2;
+  else if (averageDB <  8) return 3;
+  else if (averageDB < 10) return 4;
+  else if (averageDB < 12) return 5;
+  else if (averageDB < 14) return 6;
+  else if (averageDB < 16) return 7;
+  else if (averageDB < 18) return 8;
+  else if (averageDB < 20) return 9;
+  else if (averageDB < 22) return 10;
+  else                     return 11;
 }
 
 
@@ -309,67 +254,10 @@ int getSoundColorIndex(float averageDB) {
 // RGB LED  (Sound Reactive)
 // --------------------------------
 void updateLED(float averageDB) {
-
-  if (averageDB < 2) {
-
-    setColor(0, 0, 255);          // 1. BLUE
-
-  }
-  else if (averageDB < 4) {
-
-    setColor(0, 100, 255);        // 2. BLUE-CYAN
-
-  }
-  else if (averageDB < 6) {
-
-    setColor(0, 255, 255);        // 3. CYAN
-
-  }
-  else if (averageDB < 8) {
-
-    setColor(0, 255, 100);        // 4. CYAN-GREEN
-
-  }
-  else if (averageDB < 10) {
-
-    setColor(0, 255, 0);          // 5. GREEN
-
-  }
-  else if (averageDB < 12) {
-
-    setColor(100, 255, 0);        // 6. YELLOW-GREEN
-
-  }
-  else if (averageDB < 14) {
-
-    setColor(255, 255, 0);        // 7. YELLOW
-
-  }
-  else if (averageDB < 16) {
-
-    setColor(255, 150, 0);        // 8. ORANGE
-
-  }
-  else if (averageDB < 18) {
-
-    setColor(255, 50, 0);         // 9. ORANGE-RED
-
-  }
-  else if (averageDB < 20) {
-
-    setColor(255, 0, 0);          // 10. RED
-
-  }
-  else if (averageDB < 22) {
-
-    setColor(180, 0, 150);        // 11. RED-PURPLE
-
-  }
-  else if (averageDB >= 22) {
-
-    setColor(80, 0, 180);         // 12. DEEP PURPLE
-
-  }
+  int idx = getSoundColorIndex(averageDB);
+  setColor(ambientColors[idx][0],
+           ambientColors[idx][1],
+           ambientColors[idx][2]);
 }
 
 
@@ -397,90 +285,197 @@ void drawScreenBase() {
 
   tft.drawFastHLine(5, 19, 150, ST77XX_WHITE);
 
+  // Labels that stay for all modes
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(5, 28);
   tft.print("MODE:");
 
-  tft.setCursor(5, 48);
-  tft.print("REL dB:");
-
-  tft.setCursor(5, 68);
-  tft.print("COLOR:");
-
-  tft.setCursor(5, 88);
-  tft.print("LIGHT LEVEL");
-
-  tft.drawRect(5, 102, 150, 13, ST77XX_WHITE);
-
   lastDrawnMode = -1;
   lastDrawnColor = -1;
   lastDrawnDBTenths = -9999;
+  lastDrawnHours = -1;
+  lastDrawnMinutes = -1;
+  lastDrawnSeconds = -1;
+  lastDrawnSetting = false;
+  lastDrawnSetField = -1;
 }
 
 
 void updateScreen() {
-  int colorIndex = (mode == 1) ? ambientColor : getSoundColorIndex(averageDB);
+  int colorIndex = (mode == MODE_AMBIENT) ? ambientColor : getSoundColorIndex(averageDB);
   int dbTenths   = (int)(averageDB * 10.0);
 
-  bool textDirty =
-    (mode != lastDrawnMode) ||
-    (mode == 1 && colorIndex != lastDrawnColor) ||
-    (mode == 0 && dbTenths != lastDrawnDBTenths);
-
-  if (textDirty) {
-    // Mode
+  // ----- MODE line (all modes) -----
+  if (mode != lastDrawnMode || isSettingTime != lastDrawnSetting) {
     tft.fillRect(45, 28, 110, 12, ST77XX_BLACK);
     tft.setCursor(45, 28);
     tft.setTextColor(ST77XX_GREEN);
-    tft.print(mode == 0 ? "SOUND REACTIVE" : "AMBIENT LAMP");
-
-    // dB value
-    tft.fillRect(50, 48, 105, 12, ST77XX_BLACK);
-    tft.setCursor(50, 48);
-    tft.setTextColor(ST77XX_YELLOW);
-    if (mode == 0) {
-      tft.print(averageDB, 1);
+    if (mode == MODE_SOUND) {
+      tft.print("SOUND REACTIVE");
+    } else if (mode == MODE_AMBIENT) {
+      tft.print("AMBIENT LAMP");
     } else {
-      tft.print("PAUSED");
+      tft.print(isSettingTime ? "CLOCK  [SET]" : "CLOCK");
     }
-
-    // Color name
-    tft.fillRect(45, 68, 110, 12, ST77XX_BLACK);
-    tft.setCursor(45, 68);
-    tft.setTextColor(ST77XX_WHITE);
-    if (mode == 1) {
-      tft.print(ambientColorNames[ambientColor]);
-    } else {
-      tft.print("AUTO");
-    }
-
-    lastDrawnMode      = mode;
-    lastDrawnColor     = colorIndex;
-    lastDrawnDBTenths  = dbTenths;
+    lastDrawnMode = mode;
+    lastDrawnSetting = isSettingTime;
   }
 
-  // Level bar
-  tft.fillRect(7, 104, 146, 9, ST77XX_BLACK);
+  // ========== CLOCK MODE ==========
+  if (mode == MODE_CLOCK) {
+    // Large time
+    bool timeDirty = (clockHours != lastDrawnHours) ||
+                     (clockMinutes != lastDrawnMinutes) ||
+                     (clockSeconds != lastDrawnSeconds) ||
+                     (isSettingTime != lastDrawnSetting) ||
+                     (setField != lastDrawnSetField);
 
-  uint16_t barColor = getTFTColor(
-    ambientColors[colorIndex][0],
-    ambientColors[colorIndex][1],
-    ambientColors[colorIndex][2]
-  );
+    if (timeDirty) {
+      // Clear time area
+      tft.fillRect(5, 48, 150, 40, ST77XX_BLACK);
 
-  if (mode == 0) {
-    float boundedDB = constrain(averageDB, 0.0, 22.0);
-    int barWidth = (int)(boundedDB / 22.0 * 146.0);
-    if (barWidth > 0) {
-      tft.fillRect(7, 104, barWidth, 9, barColor);
+      // HH:MM
+      tft.setTextSize(3);
+      tft.setCursor(18, 50);
+
+      // Hours (highlight if setting hours)
+      if (isSettingTime && setField == 0) {
+        tft.setTextColor(ST77XX_YELLOW);
+      } else {
+        tft.setTextColor(ST77XX_WHITE);
+      }
+      if (clockHours < 10) tft.print('0');
+      tft.print(clockHours);
+
+      tft.setTextColor(ST77XX_WHITE);
+      tft.print(':');
+
+      // Minutes (highlight if setting minutes)
+      if (isSettingTime && setField == 1) {
+        tft.setTextColor(ST77XX_YELLOW);
+      } else {
+        tft.setTextColor(ST77XX_WHITE);
+      }
+      if (clockMinutes < 10) tft.print('0');
+      tft.print(clockMinutes);
+
+      // Seconds (smaller)
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_CYAN);
+      tft.setCursor(110, 58);
+      if (clockSeconds < 10) tft.print('0');
+      tft.print(clockSeconds);
+
+      // SET indicator
+      if (isSettingTime) {
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.setCursor(5, 90);
+        tft.print(setField == 0 ? "SET HOURS  (press=min)" : "SET MINS   (press=hrs)");
+      } else {
+        tft.fillRect(5, 90, 150, 10, ST77XX_BLACK);
+      }
+
+      lastDrawnHours    = clockHours;
+      lastDrawnMinutes  = clockMinutes;
+      lastDrawnSeconds  = clockSeconds;
+      lastDrawnSetField = setField;
     }
+
+    // Small relative dB + bar (LED is still reacting)
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(5, 105);
+    tft.print("dB:");
+    tft.fillRect(30, 105, 40, 10, ST77XX_BLACK);
+    tft.setCursor(30, 105);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.print(averageDB, 1);
+
+    // Mini level bar
+    tft.fillRect(80, 105, 70, 8, ST77XX_BLACK);
+    uint16_t barColor = getTFTColor(
+      ambientColors[colorIndex][0],
+      ambientColors[colorIndex][1],
+      ambientColors[colorIndex][2]
+    );
+    float boundedDB = constrain(averageDB, 0.0, 22.0);
+    int barWidth = (int)(boundedDB / 22.0 * 68.0);
+    if (barWidth > 0) {
+      tft.fillRect(81, 106, barWidth, 6, barColor);
+    }
+
+  // ========== SOUND / AMBIENT MODES ==========
   } else {
-    tft.fillRect(7, 104, 146, 9, barColor);   // full bar in ambient mode
+    // Clear any leftover clock graphics if we just left clock mode
+    if (lastDrawnHours != -1) {
+      tft.fillRect(5, 48, 150, 70, ST77XX_BLACK);
+      lastDrawnHours = -1;
+    }
+
+    // dB value
+    bool textDirty =
+      (mode == MODE_AMBIENT && colorIndex != lastDrawnColor) ||
+      (mode == MODE_SOUND && dbTenths != lastDrawnDBTenths) ||
+      (mode != lastDrawnMode);
+
+    if (textDirty || lastDrawnDBTenths == -9999) {
+      tft.setTextSize(1);
+      tft.setTextColor(ST77XX_WHITE);
+      tft.setCursor(5, 48);
+      tft.print("REL dB:");
+
+      tft.fillRect(50, 48, 105, 12, ST77XX_BLACK);
+      tft.setCursor(50, 48);
+      tft.setTextColor(ST77XX_YELLOW);
+      if (mode == MODE_SOUND) {
+        tft.print(averageDB, 1);
+      } else {
+        tft.print("PAUSED");
+      }
+
+      // Color name
+      tft.setCursor(5, 68);
+      tft.setTextColor(ST77XX_WHITE);
+      tft.print("COLOR:");
+      tft.fillRect(45, 68, 110, 12, ST77XX_BLACK);
+      tft.setCursor(45, 68);
+      if (mode == MODE_AMBIENT) {
+        tft.print(ambientColorNames[ambientColor]);
+      } else {
+        tft.print("AUTO");
+      }
+
+      tft.setCursor(5, 88);
+      tft.print("LIGHT LEVEL");
+      tft.drawRect(5, 102, 150, 13, ST77XX_WHITE);
+
+      lastDrawnColor    = colorIndex;
+      lastDrawnDBTenths = dbTenths;
+    }
+
+    // Level bar
+    tft.fillRect(7, 104, 146, 9, ST77XX_BLACK);
+    uint16_t barColor = getTFTColor(
+      ambientColors[colorIndex][0],
+      ambientColors[colorIndex][1],
+      ambientColors[colorIndex][2]
+    );
+
+    if (mode == MODE_SOUND) {
+      float boundedDB = constrain(averageDB, 0.0, 22.0);
+      int barWidth = (int)(boundedDB / 22.0 * 146.0);
+      if (barWidth > 0) {
+        tft.fillRect(7, 104, barWidth, 9, barColor);
+      }
+    } else {
+      tft.fillRect(7, 104, 146, 9, barColor);
+    }
   }
 }
 
 
-// ==================== BUTTON (MODE SWITCH) ===========
+// ==================== BUTTON (MODE + SET) ============
 void checkEncoderButton() {
   int reading = digitalRead(ENCODER_SW);
 
@@ -492,18 +487,54 @@ void checkEncoderButton() {
     if (reading != stableButtonState) {
       stableButtonState = reading;
 
-      if (stableButtonState == LOW) {          // button pressed
-        if (mode == 0) {
-          mode = 1;
-          ambientColor = 0;
-          setAmbientColor();
-          Serial.println(F("\nMODE: AMBIENT LAMP"));
+      if (stableButtonState == LOW) {
+        // Button just pressed
+        buttonPressStart = millis();
+        buttonHeld = false;
+      } else {
+        // Button just released
+        unsigned long pressDuration = millis() - buttonPressStart;
+
+        if (pressDuration >= LONG_PRESS_MS) {
+          // Long press
+          if (mode == MODE_CLOCK) {
+            isSettingTime = !isSettingTime;
+            if (isSettingTime) {
+              setField = 0;               // start with hours
+              Serial.println(F("CLOCK: Entered SET mode"));
+            } else {
+              Serial.println(F("CLOCK: Left SET mode"));
+            }
+            updateScreen();
+          }
         } else {
-          mode = 0;
-          resetBuffer();
-          Serial.println(F("\nMODE: SOUND REACTIVE"));
+          // Short press
+          if (mode == MODE_CLOCK && isSettingTime) {
+            // Toggle hours <-> minutes while setting
+            setField = 1 - setField;
+            updateScreen();
+            Serial.print(F("SET field: "));
+            Serial.println(setField == 0 ? "HOURS" : "MINUTES");
+          } else {
+            // Cycle modes
+            mode = (mode + 1) % 3;   // 0→1→2→0
+
+            isSettingTime = false;   // always leave set mode when changing modes
+
+            if (mode == MODE_AMBIENT) {
+              ambientColor = 0;
+              setAmbientColor();
+              Serial.println(F("\nMODE: AMBIENT LAMP"));
+            } else if (mode == MODE_SOUND) {
+              resetBuffer();
+              Serial.println(F("\nMODE: SOUND REACTIVE"));
+            } else {
+              Serial.println(F("\nMODE: CLOCK"));
+            }
+            drawScreenBase();        // clean redraw when mode changes
+            updateScreen();
+          }
         }
-        updateScreen();
       }
     }
   }
@@ -519,25 +550,75 @@ void checkEncoder() {
     if (millis() - lastEncoderChange >= ENCODER_DEBOUNCE) {
       lastEncoderChange = millis();
 
-      if (digitalRead(ENCODER_DT) != currentCLK) {
-        ambientColor++;
-      } else {
-        ambientColor--;
+      bool clockwise = (digitalRead(ENCODER_DT) != currentCLK);
+
+      if (mode == MODE_AMBIENT) {
+        // Ambient colour change
+        if (clockwise) ambientColor++;
+        else           ambientColor--;
+
+        if (ambientColor >= COLOR_COUNT) ambientColor = 0;
+        if (ambientColor < 0)            ambientColor = COLOR_COUNT - 1;
+
+        setAmbientColor();
+        updateScreen();
+
+        Serial.print(F("Ambient Color: "));
+        Serial.print(ambientColor);
+        Serial.print(F(" - "));
+        Serial.println(ambientColorNames[ambientColor]);
+
+      } else if (mode == MODE_CLOCK && isSettingTime) {
+        // Adjust hours or minutes
+        if (setField == 0) {
+          // Hours
+          if (clockwise) clockHours++;
+          else           clockHours--;
+          if (clockHours > 23) clockHours = 0;
+          if (clockHours < 0)  clockHours = 23;
+        } else {
+          // Minutes
+          if (clockwise) clockMinutes++;
+          else           clockMinutes--;
+          if (clockMinutes > 59) clockMinutes = 0;
+          if (clockMinutes < 0)  clockMinutes = 59;
+        }
+        clockSeconds = 0;          // reset seconds when setting
+        lastTick = millis();       // keep tick aligned
+        updateScreen();
+
+        Serial.print(F("Set time: "));
+        if (clockHours < 10) Serial.print('0');
+        Serial.print(clockHours);
+        Serial.print(':');
+        if (clockMinutes < 10) Serial.print('0');
+        Serial.println(clockMinutes);
       }
-
-      if (ambientColor >= COLOR_COUNT) ambientColor = 0;
-      if (ambientColor < 0)           ambientColor = COLOR_COUNT - 1;
-
-      setAmbientColor();
-      updateScreen();
-
-      Serial.print(F("Ambient Color: "));
-      Serial.print(ambientColor);
-      Serial.print(F(" - "));
-      Serial.println(ambientColorNames[ambientColor]);
     }
   }
   lastCLKState = currentCLK;
+}
+
+
+// ==================== CLOCK TICK =====================
+void updateClock() {
+  if (isSettingTime) return;          // freeze while setting
+
+  if (millis() - lastTick >= 1000) {
+    lastTick += 1000;
+    clockSeconds++;
+
+    if (clockSeconds >= 60) {
+      clockSeconds = 0;
+      clockMinutes++;
+      if (clockMinutes >= 60) {
+        clockMinutes = 0;
+        clockHours++;
+        if (clockHours >= 24) clockHours = 0;
+      }
+    }
+    // Screen will be refreshed in the main loop
+  }
 }
 
 
@@ -553,10 +634,11 @@ void setup() {
   pinMode(ENCODER_DT,  INPUT_PULLUP);
   pinMode(ENCODER_SW,  INPUT_PULLUP);
 
-  // Uncomment only if your board supports 12-bit ADC (SAMD, ESP32, etc.)
+  // Uncomment only if your board supports 12-bit ADC
   // analogReadResolution(12);
 
   lastCLKState = digitalRead(ENCODER_CLK);
+  lastTick = millis();
 
   resetBuffer();
 
@@ -564,12 +646,12 @@ void setup() {
   tft.setRotation(1);
   drawScreenBase();
 
-  // Start in sound-reactive mode with blue LED
   setColor(0, 0, 255);
   updateScreen();
 
-  Serial.println(F("LIGHT MONITOR READY (2 mics + screen + encoder)"));
-  Serial.println(F("Mode: SOUND REACTIVE"));
+  Serial.println(F("LIGHT MONITOR READY (2 mics + screen + encoder + CLOCK)"));
+  Serial.println(F("Modes: SOUND REACTIVE → AMBIENT LAMP → CLOCK"));
+  Serial.println(F("Clock: Long-press = enter/exit SET, Short-press in SET = toggle H/M"));
   Serial.println(F("Mic A = A0 | Mic B = A1  (louder wins)"));
   Serial.println(F("Encoder CLK:D7  DT:D6  SW:D2"));
   Serial.println(F("RGB LED: R=D3 G=D4 B=D5"));
@@ -579,24 +661,31 @@ void setup() {
 // ==================== MAIN LOOP ======================
 void loop() {
   checkEncoderButton();
+  checkEncoder();
 
-  if (mode == 0) {                          // Sound Reactive
+  // Sound reading + LED update for both Sound Reactive AND Clock modes
+  if (mode == MODE_SOUND || mode == MODE_CLOCK) {
     if (millis() - lastUpdateTime >= UPDATE_INTERVAL) {
       lastUpdateTime = millis();
 
-      currentDB  = readLouderMicrophone();  // ← two mics, take louder
-      averageDB  = updateBuffer(currentDB);
+      currentDB = readLouderMicrophone();
+      averageDB = updateBuffer(currentDB);
 
-      updateLED(averageDB);
-      updateScreen();
+      updateLED(averageDB);          // LED always reacts in these two modes
 
-      Serial.print(F("Louder relative dB: "));
-      Serial.print(currentDB, 2);
-      Serial.print(F(" | Weighted avg: "));
-      Serial.println(averageDB, 2);
+      if (mode == MODE_SOUND) {
+        updateScreen();
+      }
+      // Clock mode screen is updated below after the tick
     }
-  } else {                                  // Ambient Lamp
-    checkEncoder();
-    delay(2);
   }
+
+  // Clock-specific work
+  if (mode == MODE_CLOCK) {
+    updateClock();
+    updateScreen();                  // keeps time + mini bar fresh
+  }
+
+  // Small yield so the encoder stays responsive
+  delay(2);
 }
